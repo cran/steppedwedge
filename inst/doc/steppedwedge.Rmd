@@ -31,6 +31,8 @@ dat <- load_data(
 )
 ```
 
+# Loading data
+
 The `load_data` function takes in raw data and creates a data object that can be accepted by the `plot_design` and `analyze` functions. We use the made-up dataframe `sw_data_example` to demonstrate the workflow.
 
 ```{r}
@@ -47,6 +49,7 @@ dat <- load_data(
 )
 ```
 
+# Plotting the design
 
 The `plot_design` function produces a diagram of the stepped wedge design and a summary of the variables.
 
@@ -56,8 +59,10 @@ plot_dat <- plot_design(dat)
 print(plot_dat)
 ```
 
+# Analyzing the data
 
 The `analyze` function analyzes the stepped wedge data. First, we analyze the data using a mixed effects model, with the Time Average Treament Effect (TATE) as the estimand, assuming an Immediate Treatment (IT) effect, passing the `family = "binomial"` and `link = "logit"` arguments to `glmer`. 
+## Binary outcome
 
 ```{r}
 analysis_1 <- analyze(
@@ -134,27 +139,41 @@ print(analysis_4)
 ```
 
 
-Mixed model, with Time Average Treament Effect (TATE) as the estimand, using a Treatment Effect Heterogeneity over exposure time (TEH) model.
+Mixed model using a Delayed Constant Treatment (DCT) model. This model assumes the treatment effect during the first `w` exposure time periods is a nuisance "washout" effect, after which the treatment stabilizes to a constant effect $\delta$. Set `w` via `params()`.
 
 ```{r}
 analysis_5 <- analyze(
   dat = dat,
   method = "mixed",
-  estimand_type = "TATE", 
-  exp_time = "TEH",
-  family = binomial
+  estimand_type = "TATE",
+  exp_time = "DCT",
+  family = binomial,
+  advanced = params(w = 2)
 )
 
 print(analysis_5)
 ```
+
+The returned `te_est` is the estimate of $\delta$ — the constant treatment effect after the washout period. The washout-period coefficients ($\delta_1, \delta_2$) are estimated internally but treated as nuisance parameters.
+
 
 ## Continuous outcome
 
 Mixed model, with Time Average Treament Effect (TATE) as the estimand, using a Natural Cubic Splines (NCS) model.
 
 ```{r}
+
+dat_cont <- load_data(
+  time = "period",
+  cluster_id = "cluster",
+  individual_id = NULL,
+  treatment = "trt",
+  outcome = "outcome_cont",
+  data = sw_data_example
+)
+
 analysis_6 <- analyze(
-  dat = dat,
+  dat = dat_cont,
   method = "mixed",
   estimand_type = "TATE", 
   exp_time = "NCS",
@@ -163,3 +182,93 @@ analysis_6 <- analyze(
 
 print(analysis_6)
 ```
+
+## Binomial outcome
+
+When loading data where the outcome is binomial, specify the names of the "# of successes" and "# of trials" variables as the `outcome` argument.
+
+```{r}
+
+dat_binom <- load_data(
+  time ="period",
+  cluster_id = "cluster",
+  individual_id = NULL,
+  treatment = "trt",
+  outcome = c("numerator", "denominator"),
+  data = sw_data_example_binom
+)
+
+```
+
+
+Mixed model, with Time Average Treament Effect (TATE) as the estimand, using an Exposure Time Indicator (ETI) model.
+
+```{r}
+
+analysis_binom <- analyze(
+  dat = dat_binom,
+  method = "mixed",
+  family = binomial,
+  estimand_type = "TATE", 
+  exp_time = "ETI")
+
+print(analysis_binom)
+
+```
+
+
+# Plotting effect curves
+
+The `plot_effect_curve` function plots effect estimates by exposure time for one or more `analyze` objects. 
+
+```{r}
+
+IT_model <- analyze(
+  dat = dat_cont, method = "mixed", estimand_type = "TATE",
+  estimand_time = c(1, 4), exp_time = "IT"
+)
+ETI_model <- analyze(
+  dat = dat_cont, method = "mixed", estimand_type = "TATE", 
+  estimand_time = c(1, 4), exp_time = "ETI"
+)
+NCS_4_model <- analyze(
+  dat = dat_cont, method = "mixed", estimand_type = "TATE",
+  estimand_time = c(1, 4), exp_time = "NCS", 
+  advanced = params(n_knots_exp = 4)
+)
+DCT_model <- analyze(
+  dat = dat_cont, method = "mixed", estimand_type = "TATE",
+  estimand_time = c(1, 4), exp_time = "DCT",
+  advanced = params(w = 2)
+)
+
+plot_effect_curves(IT_model, ETI_model, NCS_4_model, DCT_model, facet_nrow = 2)
+
+
+```
+
+# Plotting cluster charts
+
+The `plot_clusters` function plots actual and predicted outcomes for each cluster by calendar time for an `analyze` object.
+
+## Continuous outcome
+
+For continuous outcomes, the actual outcomes are jittered, with the predicted outcomes represented by the plotted line:
+
+```{r, fig.height = 8}
+
+plot_clusters(analysis_6, ncol = 3)
+
+```
+
+## Binary outcome
+
+For binary outcomes, the observed probability for each cluster period is plotted as a point, with the predicted probabilities represented by the plotted line:
+
+```{r, fig.height = 8}
+
+plot_clusters(analysis_4, ncol = 3)
+
+```
+
+

@@ -1,23 +1,49 @@
-#' Summarize a list returned by steppedwedge::analysis()
+#' Summarize a list returned by steppedwedge::analyze()
 #'
-#' @param x A list returned by steppedwedge::analysis()
+#' @param x A list returned by steppedwedge::analyze()
 #' @param ... Additional arguments
 #'
 #' @return A summary of the analysis object, including an estimate and 95% CI for the treatment effect, and messages on convergence.
+#' @noRd
 #' @export
-#'
-#' @examples
-#' # Load data
-#' test_data <- load_data(time ="period", cluster_id = "cluster", individual_id = NULL,
-#' treatment = "trt", outcome = "outcome_bin", data = sw_data_example)
-#' 
-#' # Analysis example: TATE estimand for exposure times 1 through 4
-#' results_tate <- analyze(dat = test_data, method = "mixed", estimand_type = "TATE",
-#' estimand_time = c(1, 4), exp_time = "ETI", family = poisson)
-#' 
-#' results_tate
 print.sw_analysis <- function(x, ...) {
-  cat("Treatment effect estimate: ", round(x$te_est, 3), "\n", sep = "")
-  cat("Treatment effect 95% confidence interval: ", round(x$te_ci[1], 3), ", ", round(x$te_ci[2], 3), "\n", sep = "")
-  cat("Converged: ", x$converged, "\n", sep = "")
+  
+  # 1. Model Summary
+  if (x$method == "GEE") {
+    cat("GEE model with working ", x$corstr, " correlation structure\n", sep = "")
+  } else if (x$method == "mixed") {
+    # Map random effects codes to readable strings
+    re_map <- c(clust = "cluster", time = "time", ind = "individual", tx = "treatment")
+    re_readable <- re_map[x$re]
+    
+    # Handle case where mapping fails (fallback to raw code)
+    re_readable[is.na(re_readable)] <- x$re[is.na(re_readable)]
+    
+    # Combine into a string (e.g., "cluster and time")
+    re_string <- paste(re_readable, collapse = " and ")
+    
+    cat("Mixed model with random effects for ", re_string, "\n", sep = "")
+  }
+  
+  # 2. Time Assumptions
+  cat('Exp time: "', x$exp_time, '", cal time: "', x$cal_time, '"\n', sep = "")
+  if (length(x$covariates) > 0) {
+    cat("Covariates: ", paste(x$covariates, collapse = ", "), "\n", sep = "")
+  }
+  
+  # Determine suffix for labels if exponentiated
+  suffix <- if (isTRUE(x$exponentiated)) " (exponentiated)" else ""
+  
+  # 3. Estimand & 4. CI
+  cat(x$estimand_type, " estimate", suffix, ": ", round(x$te_est, 3), "\n", sep = "")
+  cat(x$estimand_type, " 95% confidence interval", suffix, ": ", 
+      round(x$te_ci[1], 3), ", ", round(x$te_ci[2], 3), "\n", sep = "")
+  
+  # 5. P-value
+  cat(x$estimand_type, " p-value: ", format.pval(x$te_p, eps = 0.001), "\n", sep = "")
+  
+  # 6. Convergence
+  # For GEE models, x$converged is NA, so we print "NA" explicitly
+  conv_output <- ifelse(is.na(x$converged), "NA", x$converged)
+  cat("Converged: ", conv_output, "\n", sep = "")
 }

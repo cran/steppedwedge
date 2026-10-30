@@ -10,8 +10,11 @@ load_data(
   individual_id = NULL,
   treatment,
   outcome,
+  exposure_time = NULL,
+  offset = NULL,
   time_type = "discrete",
-  data
+  data,
+  covariates = NULL
 )
 }
 \arguments{
@@ -35,10 +38,27 @@ data, the vector of two character strings indicates the "# of successes"
 variable and the "# of trials" variable, respectively. Values in the
 outcome variable(s) must be either numeric or Boolean (T/F).}
 
+\item{exposure_time}{A character string (optional); the name of the numeric
+variable identifying the exposure time variable. If this is not provided,
+the package will calculate exposure time automatically based on
+\code{treatment} and \code{time}.}
+
+\item{offset}{A character string (optional); the name of the numeric
+variable specifying the offset. The offset is added to the linear
+predictor of every model fit by \code{\link{analyze}}. Rows with a
+missing offset are dropped.}
+
 \item{time_type}{One of c("discrete", "continuous"); whether the model treats
 time as discrete or continuous.}
 
 \item{data}{A dataframe containing the stepped wedge trial data.}
+
+\item{covariates}{A character vector (optional); the names of variables in
+`data` to include as additive covariates in the mean model fit by
+\code{\link{analyze}}. Covariates can be individual-level or
+cluster-level and must be numeric, binary, or categorical. Typically,
+covariates are chosen because of presumed association with the outcome,
+which may increase the precision of treatment effect estimation.}
 }
 \value{
 An object of class \code{sw_data}
@@ -47,9 +67,19 @@ An object of class \code{sw_data}
 Load and format data object
 }
 \examples{
-example_data <- load_data(time ="period", cluster_id = "cluster", individual_id = NULL,
-treatment = "trt", outcome = "outcome_cont", data = sw_data_example)
+example_data <- load_data(time = "period", cluster_id = "cluster", individual_id = NULL,
+treatment = "trt", outcome = "outcome_cont", offset = NULL, data = sw_data_example)
 base::summary(example_data)
 
+example_data_binomial <- load_data(time ="period", cluster_id = "cluster", individual_id = NULL,
+treatment = "trt", outcome = c("numerator", "denominator"), data = sw_data_example_binom)
+base::summary(example_data_binomial)
+
+# Including covariates in the mean model
+sw_data_cov <- sw_data_example
+sw_data_cov$x <- stats::rnorm(nrow(sw_data_cov))
+example_data_cov <- load_data(time = "period", cluster_id = "cluster",
+treatment = "trt", outcome = "outcome_cont", data = sw_data_cov,
+covariates = "x")
 
 }

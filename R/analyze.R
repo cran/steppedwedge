@@ -12,13 +12,16 @@
 #'     average over. When estimand_type="PTE", `estimand_time` must be a numeric
 #'     vector of length 1, representing the time period of interest. See
 #'     examples.
-#' @param exp_time One of c("IT", "ETI", "NCS", "TEH"); model for exposure time.
+#' @param exp_time One of c("IT", "ETI", "DCT", "NCS", "TEH"); model for exposure time.
 #'     "IT" encodes an immediate treatment model with a single treatment effect
 #'     parameter. "ETI" is an exposure time indicator model, including one
 #'     indicator variable for each exposure time point. "NCS" uses a natural
 #'     cubic spline model for the exposure time trend. "TEH" includes a random
 #'     slope term in the model, allowing the treatment effect to vary by
-#'     timepoint.
+#'     timepoint. "DCT" encodes a delayed constant treatment model, which
+#'     estimates individual effects for a specified number of washout periods
+#'     (set via the `w` parameter in `advanced`) followed by a single constant
+#'     treatment effect.
 #' @param cal_time One of c("categorical", "NCS", "linear", "none"); model for
 #'     calendar time. "categorical" uses indicator variables for discrete time
 #'     points, as in the Hussey and Hughes model. "NCS" uses a natural cubic
@@ -26,19 +29,45 @@
 #'     slope parameter. "none" assumes that there is no underlying calendar time
 #'     trend.
 #' @param family A family object; see documentation for `glm`.
+#' @param exponentiate Logical; if TRUE, return exponentiated treatment effect
+#'     estimates and confidence intervals (including in the `effect_curve`
+#'     object). Defaults to FALSE.
 #' @param re A character vector of random effects to include; only relevant if
 #'     method="mixed" is used. Possible random effects include "clust" (random
-#'     intercept for cluster), "time" (random intercept for cluster-time
-#'     interaction), "ind" (random intercept for individuals; appropriate when a
-#'     cohort design is used), "tx" (random treatment effect)
+#'     intercept for cluster), "time" (random intercept for each cluster-period,
+#'     i.e. each combination of cluster and calendar time; calendar time is the
+#'     `time` variable passed to `load_data()`, not exposure time), "ind"
+#'     (random intercept for individuals; appropriate when a cohort design is
+#'     used), and "tx" (a cluster-level random slope on treatment; see
+#'     Details).
 #' @param corstr One of c("independence", "exchangeable", "ar1"); only relevant
 #'     if method="GEE" is used. Defines the GEE working correlation structure;
 #'     see the documentation for `geepack::geeglm`.
-#' @param offset A linear predictor offset term; see docs for `lme4::lmer`.
+#' @param advanced A list of options returned by \code{\link{params}}.
+#'
+#' @details Covariates specified via the `covariates` argument of
+#'     \code{\link{load_data}} are included in the mean model as additive main
+#'     effects, alongside the calendar time and exposure time terms. Covariates
+#'     should typically be measured before randomization.
+#'
+#'     With `re = "tx"`, each cluster has a random slope on the treatment
+#'     indicator. This results in an additive deviation from the main treatment
+#'     effect coefficient. In models that allow for a time-varying treatment
+#'     effect (ETI, NCS, DCT, and TEH), the cluster-specific deviation results
+#'     in an additive scaling of the entire effect curve. Here, "additive"
+#'     refers to the linear predictor scale; the effects relative to the outcome
+#'     will be different if a nonlinear link function is used. For example, if a
+#'     log link function is used, the deviations will have a multiplicative
+#'     effect on the outcome.
 #'
 #' @return A list with the model object, model type as a string, estimand type
-#' as a string, numeric treatment effect estimate, numeric treatment effect standard error, and
-#' treatment effect 95% confidence interval as a numeric vector of length 2
+#' as a string, numeric treatment effect estimate, numeric treatment effect standard error,
+#' treatment effect 95% confidence interval as a numeric vector of length 2,
+#' p-value corresponding to the null hypothesis that the main treatment effect
+#' estimand equals zero, a list with treatment effect estimates (and standard errors
+#' and 95% confidence intervals) at each exposure timepoint, the original dataframe
+#' passed to `analyze()`, and an indicator whether the effect estimates and CI
+#' are exponentiated.
 #' @export
 #'
 #' @examples
@@ -58,18 +87,46 @@
 #'
 #' results_pte
 #'
-analyze <- function(dat, method="mixed", estimand_type="TATE",
-                    estimand_time=c(1,attr(dat,"n_seq")), exp_time="IT",
-                    cal_time="categorical", family=stats::gaussian,
-                    re=c("clust", "time"), corstr="exchangeable", offset=NULL) {
+#' # Analysis example 3: TATE estimand for exposure times 1 through 4, Natural Cubic Splines model
+#' results_tate_ncs <- analyze(dat = test_data, method = "mixed", estimand_type = "TATE",
+#' estimand_time = c(1, 4), exp_time = "NCS", advanced = params(n_knots_exp = 4))
+#'
+#' results_tate_ncs
+#'
+#' # Analysis example 4: TATE estimand for exposure times 1 through 4 with binomial outcome data
+#' # Load data
+#' test_data_bin <- load_data(time ="period", cluster_id = "cluster", individual_id = NULL,
+#' treatment = "trt", outcome = c("numerator", "denominator"), data = sw_data_example_binom)
+#'
+#' results_pte_bin <- analyze(dat = test_data_bin, family = binomial, method = "mixed",
+#' estimand_type = "TATE", estimand_time = c(1, 4), exp_time = "ETI")
+#'
+#' results_pte_bin
+#'
+#' # Analysis example 5: TATE estimand using the Delayed Constant Treatment (DCT) model,
+#' # with a washout period of w = 2 exposure times
+#' results_tate_dct <- analyze(dat = test_data, method = "mixed", estimand_type = "TATE",
+#' estimand_time = c(1, 4), exp_time = "DCT", advanced = params(w = 2))
+#'
+#' results_tate_dct
+#'
 
+
+analyze <- function(dat, method="mixed", estimand_type="TATE",
+                    estimand_time=c(1,max(dat$exposure_time)), exp_time="IT",
+                    cal_time="categorical", family=stats::gaussian,
+                    exponentiate = FALSE,
+                    re=c("clust", "time"), corstr="exchangeable",
+                    advanced = params()) {
+
+  dat_orig <- dat
   cluster_id <- NULL
   rm(cluster_id)
 
   if (!(cal_time %in% c("categorical", "NCS", "linear", "none"))) {
     stop("`cal_time` misspecified.")
   }
-  if (!(exp_time %in% c("IT", "ETI", "NCS", "TEH"))) {
+  if (!(exp_time %in% c("IT", "ETI", "NCS", "TEH", "DCT"))) {
     stop("`exp_time` misspecified.")
   }
   if (!all(re %in% c("clust", "time", "ind", "tx"))) {
@@ -85,6 +142,9 @@ analyze <- function(dat, method="mixed", estimand_type="TATE",
   }
 
   if (!methods::is(dat,"sw_dat")) { stop("`dat` must be of class `sw_dat`.") }
+  if (method == "mixed" && exp_time == "TEH" && advanced$var_est == "robust") {
+    stop("Robust variance estimation (var_est = 'robust') is not possible for the Treatment Effect Heterogeneity (TEH) model. Please use var_est = 'model' or select a different exp_time model (e.g., 'ETI').")
+  }
 
   # call appropriate family function with chosen link to create family object
   if (is.character(family)) {
@@ -101,43 +161,94 @@ analyze <- function(dat, method="mixed", estimand_type="TATE",
     f_cal <- ""
   } else if (cal_time=="NCS") {
 
-    knots_cal <- seq(min(dat$time), max(dat$time), length.out=4) # Make this configurable
+    knots_cal <- seq(min(dat$time), max(dat$time), length.out=advanced$n_knots_cal)
     basis_cal <- splines::ns(
       x = dat$time,
-      knots = knots_cal[2:3],
+      knots = knots_cal[2:(advanced$n_knots_cal-1)],
       intercept = TRUE,
-      Boundary.knots = knots_cal[c(1,4)]
+      Boundary.knots = knots_cal[c(1,advanced$n_knots_cal)]
     )
-    dat$j_1 <- basis_cal[,1]
-    dat$j_2 <- basis_cal[,2]
-    dat$j_3 <- basis_cal[,3]
-    dat$j_4 <- basis_cal[,4]
+    dat$j <- rep(NA, nrow(dat))
+    for (i in 1:advanced$n_knots_cal) {
+      dat[[paste0("j_", i)]] <- basis_cal[,i]
+    }
+    f_cal_terms <- paste0("j_", 1:ncol(basis_cal))
+    f_cal <- paste(f_cal_terms, collapse = " + ")
+    f_cal <- paste0(f_cal, " - 1 + ")
+
     rm(knots_cal,basis_cal)
-
-    f_cal <- "j_1 + j_2 + j_3 + j_4 - 1 + "
-
   }
 
   # Parse formula terms for random effects
   f_re <- ""
-  if ("clust" %in% re) {
-    f_re <- paste0(f_re, " + (1|cluster_id)")
+  if ("clust" %in% re && "tx" %in% re) {
+    if (advanced$re_correlated) {
+      f_re <- paste0(f_re, " + (1 + treatment | cluster_id)")
+    } else {
+      f_re <- paste0(f_re, " + (1 + treatment || cluster_id)")
+    }
+  } else if ("clust" %in% re) {
+    f_re <- paste0(f_re, " + (1 | cluster_id)")
+  } else if ("tx" %in% re) {
+    f_re <- paste0(f_re, " + (0 + treatment | cluster_id)")
   }
+
   if ("time" %in% re) {
     dat$ij <- as.integer(factor(paste0(dat$cluster_id,"-",dat$time)))
     f_re <- paste0(f_re, " + (1|ij)")
   }
+
   if ("ind" %in% re) {
     f_re <- paste0(f_re, " + (1|individual_id)")
-  }
-  if ("tx" %in% re) {
-    stop("Random treatment effects not yet implemented")
   }
 
   # Parse formula terms for outcome
   f_out <- ifelse(attr(dat, "binomial") == TRUE,
                   "cbind(successes, trials - successes) ~ ",
                   "outcome ~ ")
+
+  # Parse formula terms for covariates; these are placed before the exposure
+  #     time terms so that treatment-related coefficients come last
+  covariates <- attr(dat, "covariates")
+  f_cov <- if (length(covariates) > 0) {
+    paste0(paste0("`", covariates, "`", collapse = " + "), " + ")
+  } else {
+    ""
+  }
+
+  # Resolve the offset. The `offset` column stored by load_data() is aligned
+  #     with the rows of `dat`; a raw vector passed via params(offset = ) may not
+  #     be, because load_data() drops incomplete rows and reorders clusters.
+  if (!is.null(advanced$offset)) {
+    if ("offset" %in% names(dat)) {
+      stop("An offset was specified in both `load_data()` and `params()`. ",
+           "Specify it only via `load_data(offset = )`.")
+    }
+    if (length(advanced$offset) != nrow(dat)) {
+      stop("`params(offset = )` has length ", length(advanced$offset),
+           " but the data has ", nrow(dat), " rows. Specify the offset via ",
+           "`load_data(offset = )` instead.")
+    }
+    warning("`params(offset = )` is deprecated; use `load_data(offset = )` ",
+            "instead. A vector passed to `params()` must already match the ",
+            "row order of the `load_data()` output, which sorts rows by ",
+            "cluster rollout order.", call. = FALSE)
+    dat$offset <- advanced$offset
+  }
+  f_off <- if ("offset" %in% names(dat)) " + offset(offset)" else ""
+
+  fit_mixed <- function(formula) {
+    if (family$family == "gaussian" && family$link == "identity") {
+      lme4::lmer(formula, data = dat)
+    } else {
+      lme4::glmer(formula, family = family, data = dat)
+    }
+  }
+
+  # Save vector of (non-zero) exposure times
+  exp_times <- sort(unique(dat$exposure_time))
+  exp_times <- exp_times[exp_times!=0]
+  max_exp_time <- max(exp_times)
 
   if(method == "mixed" & estimand_type %in% c("TATE", "PTE") & exp_time == "IT") {
 
@@ -146,14 +257,11 @@ analyze <- function(dat, method="mixed", estimand_type="TATE",
     ################################################.
 
     # Fit mixed model
-    if(family$family == "gaussian" & family$link == "identity") {
-      formula <- paste0(f_out, f_cal, "treatment", f_re)
-      model_it_mixed <- lme4::lmer(formula, data=dat, offset=offset)
-    } else {
-      formula <- paste0(f_out, f_cal, "treatment", f_re)
-      model_it_mixed <- lme4::glmer(formula, family=family, data=dat,
-                                    offset=offset)
-    }
+    formula <- stats::as.formula(paste0(
+      f_out, f_cal, f_cov, "treatment", f_off, f_re
+    ))
+    model_it_mixed <- fit_mixed(formula)
+
 
     summary_it <- summary(model_it_mixed)
 
@@ -161,8 +269,42 @@ analyze <- function(dat, method="mixed", estimand_type="TATE",
     #     effect; recall that the TATE estimator for any interval and the PTE
     #     estimators are all equivalent when using the immediate treatment model
     te_est <- summary_it$coefficients["treatment",1]
-    te_se <- summary_it$coefficients["treatment",2]
+    if(advanced$var_est == "model") {
+      te_se <- summary_it$coefficients["treatment",2]
+    } else if(advanced$var_est == "robust") {
+      cov_cr  <- vcovCR.glmerMod(model_it_mixed, cluster = dat$cluster_id,
+                                 type = advanced$var_est_type)
+      cov_mtx <- cov_cr["treatment", "treatment"]
+      te_se  <- sqrt(cov_mtx)
+    }
     te_ci <- te_est + c(-1.96,1.96) * te_se
+
+    # Calculate P-value (Wald test) before exponentiation
+    te_p <- 2 * (1 - stats::pnorm(abs(te_est / te_se)))
+
+    if(exponentiate) {
+      te_est <- exp(te_est)
+      te_ci <- exp(te_ci)
+      zero_value <- 1
+    } else {
+      zero_value <- 0
+    }
+
+    # Estimate the effect curve
+    effect_curve <- list(
+      exp_time = c(0, exp_times),
+      est = c(zero_value, rep(te_est, length(exp_times))),
+      se = c(0, rep(te_se, length(exp_times))),
+      vcov = NA,
+      ci_lower = c(zero_value, rep(te_ci[1], length(exp_times))),
+      ci_upper = c(zero_value, rep(te_ci[2], length(exp_times)))
+    )
+
+    if(lme4::isSingular(model_it_mixed)) {
+      is_converged <- FALSE
+    } else {
+      is_converged <- performance::check_convergence(model_it_mixed)[1]
+    }
 
     results <- list(
       model = model_it_mixed,
@@ -171,8 +313,11 @@ analyze <- function(dat, method="mixed", estimand_type="TATE",
       te_est = te_est,
       te_se = te_se,
       te_ci = te_ci,
-      converged = performance::check_convergence(model_it_mixed)[1],
-      messages = model_it_mixed@optinfo$conv$lme4$messages
+      te_p = te_p,
+      converged = is_converged,
+      messages = model_it_mixed@optinfo$conv$lme4$messages,
+      effect_curve = effect_curve,
+      dat = dat_orig
     )
   } else if(method == "mixed" & exp_time == "ETI") {
 
@@ -181,314 +326,70 @@ analyze <- function(dat, method="mixed", estimand_type="TATE",
     ##### Exposure Time Indicator (ETI) mixed model #####
     #####################################################.
 
-    # Fit mixed model
-    if(family$family == "gaussian" & family$link == "identity") {
-      formula <- paste0(f_out, f_cal, "factor(exposure_time)", f_re)
-      model_eti_mixed <- lme4::lmer(formula, data=dat, offset=offset)
-    } else {
-      formula <- paste0(f_out, f_cal, "factor(exposure_time)", f_re)
-      model_eti_mixed <- lme4::glmer(formula, family=family, data=dat,
-                                     offset=offset)
+    for (i in c(1:length(exp_times))) {
+      dat[[paste0("exp_",exp_times[i])]] <- as.integer(dat$exposure_time==exp_times[i])
     }
+
+    f_exp <- paste0("exp_", exp_times, collapse = " + ")
+
+    # Fit mixed model
+    formula <- stats::as.formula(paste0(
+      f_out, f_cal, f_cov, f_exp, f_off, f_re
+    ))
+    model_eti_mixed <- fit_mixed(formula)
+
 
     summary_eti <- summary(model_eti_mixed)
 
 
     # Specify the indices of summary_eti corresponding to the exposure time variables
-    indices <- grep("exposure_time", rownames(summary_eti$coefficients))
+    indices <- grep("^exp_[0-9]+$", rownames(summary_eti$coefficients))
     index_max <- length(indices)
 
     # Extract coefficient estimates and covariance matrix corresponding to exposure
     #     time variables
     coeffs <- summary_eti$coefficients[,1][indices] # column 1 contains the estimates
-    cov_mtx <- stats::vcov(model_eti_mixed)[indices,indices]
-
-    if(estimand_type == "TATE") {
-
-      # Estimate the TATE
-      num_estimand_timepoints <- estimand_time[2] - estimand_time[1] + 1
-      M <- matrix(c(rep(0, estimand_time[1] - 1),
-                    rep(1 / num_estimand_timepoints, num_estimand_timepoints),
-                    rep(0, index_max - estimand_time[2])
-                  ),
-                  nrow = 1)
-      tate_est <- (M %*% coeffs)[1]
-      tate_se <- (sqrt(M %*% cov_mtx %*% t(M)))[1,1]
-      tate_ci <- tate_est + c(-1.96,1.96) * tate_se
-
-      results <- list(
-        model = model_eti_mixed,
-        model_type = "eti_mixed",
-        estimand_type = "TATE",
-        te_est = tate_est,
-        te_se = tate_se,
-        te_ci = tate_ci,
-        converged = performance::check_convergence(model_eti_mixed)[1],
-        messages = model_eti_mixed@optinfo$conv$lme4$messages
-      )
-
-    } else if(estimand_type == "PTE") {
-
-      # Estimate the PTE
-      pte_est <- as.numeric(coeffs[estimand_time])
-      pte_se <- sqrt(cov_mtx[estimand_time,estimand_time])
-      pte_ci <- pte_est + c(-1.96,1.96) * pte_se
-
-      results <- list(
-        model = model_eti_mixed,
-        model_type = "eti_mixed",
-        estimand_type = "PTE",
-        te_est = pte_est,
-        te_se = pte_se,
-        te_ci = pte_ci,
-        converged = performance::check_convergence(model_eti_mixed)[1],
-        messages = model_eti_mixed@optinfo$conv$lme4$messages
-      )
-      #
-      # # Estimate the effect curve
-      # curve_eti <- as.numeric(c(0, coeffs))
-
+    if(advanced$var_est == "model") {
+      se_eti <- summary_eti$coefficients[,2][indices] # column 2 contains the standard errors
+      cov_mtx <- stats::vcov(model_eti_mixed)[indices,indices]
+    } else if(advanced$var_est == "robust") {
+      cov_cr  <- vcovCR.glmerMod(model_eti_mixed, cluster = dat$cluster_id,
+                                 type = advanced$var_est_type)
+      cov_mtx <- cov_cr[indices, indices, drop = FALSE]
+      se_eti  <- sqrt(Matrix::diag(cov_mtx))
     }
 
-  } else if(method == "mixed" & exp_time == "TEH") {
+    # Calculate the CI for treatment effect at each exposure time
+    ci_lower_eti <- coeffs - 1.96 * se_eti
+    ci_upper_eti <- coeffs + 1.96 * se_eti
 
-
-    #####################################################.
-    ##### Treatment Effect Heterogeneity (TEH) mixed model #####
-    #####################################################.
-
-
-    # Fit mixed model
-    if(family$family == "gaussian" & family$link == "identity") {
-      formula <- paste0(f_out, f_cal, "treatment + (0 + treatment|exposure_time)", f_re)
-      model_teh_mixed <- lme4::lmer(formula, data=dat, offset=offset)
+    if(exponentiate) {
+      coeffs_return <- exp(coeffs)
+      ci_lower_eti_return <- exp(ci_lower_eti)
+      ci_upper_eti_return <- exp(ci_upper_eti)
+      zero_value <- 1
     } else {
-      formula <- paste0(f_out, f_cal, "treatment + (0 + treatment|exposure_time)", f_re)
-      model_teh_mixed <- lme4::glmer(formula, family=family, data=dat,
-                                     offset=offset)
+      coeffs_return <- coeffs
+      ci_lower_eti_return <- ci_lower_eti
+      ci_upper_eti_return <- ci_upper_eti
+      zero_value <- 0
     }
 
-    summary_teh <- summary(model_teh_mixed)
-
-    if(estimand_type == "TATE") {
-
-      # Estimate the TATE
-      tate_est <- summary_teh$coefficients["treatment",1]
-      tate_se <- summary_teh$coefficients["treatment",2]
-      tate_ci <- tate_est + c(-1.96,1.96) * tate_se
-
-      results <- list(
-        model = model_teh_mixed,
-        model_type = "teh_mixed",
-        estimand_type = "TATE",
-        te_est = tate_est,
-        te_se = tate_se,
-        te_ci = tate_ci,
-        converged = performance::check_convergence(model_teh_mixed)[1],
-        messages = model_teh_mixed@optinfo$conv$lme4$messages
-      )
-
-    } else if(estimand_type == "PTE") {
-
-      # Estimate the PTE by combining the estimates from the fixed effect component and the random effect for the final timepoint
-      exp_timepoints <- unique(dat$exposure_time[dat$exposure_time != 0])
-      max_exp_timepoint <- max(exp_timepoints)
-      re_treatment <- lme4::ranef(model_teh_mixed)$exposure_time
-      re_treatment_pte <- re_treatment[rownames(re_treatment) == as.character(estimand_time), "treatment"]
-      pte_est <- lme4::fixef(model_teh_mixed)["treatment"] + re_treatment_pte
-
-      # Estimate the SE of the PTE by combining the variances from the fixed effect component and the random effect for the final timepoint
-      re_var <- attr(lme4::ranef(model_teh_mixed, condVar = TRUE)$exposure_time, "postVar")[1,1,]
-      re_se <- sqrt(re_var)
-      re_se_pte <- re_se[estimand_time]
-
-      pte_se <- sqrt(summary_teh$coefficients["treatment",2]^2 + re_se_pte^2)
-      pte_ci <- pte_est + c(-1.96,1.96) * pte_se
-
-      results <- list(
-        model = model_teh_mixed,
-        model_type = "teh_mixed",
-        estimand_type = "PTE",
-        te_est = pte_est,
-        te_se = pte_se,
-        te_ci = pte_ci,
-        converged = performance::check_convergence(model_teh_mixed)[1],
-        messages = model_teh_mixed@optinfo$conv$lme4$messages
-      )
-      #
-      # # Estimate the effect curve
-      # curve_teh <- as.numeric(c(0, coeffs))
-
-    }
-
-  } else if(method == "mixed" & exp_time == "NCS") {
-
-
-    ############################################.
-    ##### Natural Cubic Spline (NCS) mixed model #####
-    ############################################.
-
-    # Create the spline basis (4 degrees of freedom)
-    n_df_exp <- 4
-    S <- max(dat$exposure_time)
-    knots_exp <- seq(0, S, length.out=n_df_exp) # Make this configurable
-    ns_basis <- splines::ns(
-      x = dat$exposure_time,
-      knots = knots_exp[2:3],
-      intercept = TRUE,
-      Boundary.knots = knots_exp[c(1,n_df_exp)]
+    # Estimate the effect curve
+    effect_curve <- list(
+      exp_time = c(0, exp_times),
+      est = c(zero_value, as.numeric(coeffs_return)),
+      se = c(0, se_eti),
+      vcov = cov_mtx,
+      ci_lower = c(zero_value, as.numeric(ci_lower_eti_return)),
+      ci_upper = c(zero_value, as.numeric(ci_upper_eti_return))
     )
-    dat$b1 <- ns_basis[,1] * dat$treatment
-    dat$b2 <- ns_basis[,2] * dat$treatment
-    dat$b3 <- ns_basis[,3] * dat$treatment
-    dat$b4 <- ns_basis[,4] * dat$treatment
 
-    # Fit mixed model
-    if(family$family == "gaussian" & family$link == "identity") {
-      formula <- paste0(f_out, f_cal, "b1 + b2 + b3 + b4", f_re)
-      model_ncs_mixed <- lme4::lmer(formula, data=dat, offset=offset)
+    if(lme4::isSingular(model_eti_mixed)) {
+      is_converged <- FALSE
     } else {
-      formula <- paste0(f_out, f_cal, "b1 + b2 + b3 + b4", f_re)
-      model_ncs_mixed <- lme4::glmer(formula, family=family, data=dat,
-                                     offset=offset)
+      is_converged <- performance::check_convergence(model_eti_mixed)[1]
     }
-
-    summary_ncs <- summary(model_ncs_mixed)
-
-    # Specify the indices corresponding to the spline terms
-    indices <- grep("^b[0-9]+$", rownames(summary_ncs$coefficients))
-    index_max <- length(indices)
-
-    # Extract coefficient estimates and covariance matrix corresponding to spline
-    #     terms
-    coeffs_spl <- summary_ncs$coefficients[,1][indices]
-    cov_mtx_spl <- stats::vcov(model_ncs_mixed)[indices,indices]
-
-    # Get number of unique (non-zero) exposure times
-    exp_timepoints <- unique(dat$exposure_time[dat$exposure_time != 0])
-    num_exp_timepoints <- length(exp_timepoints)
-    max_exp_timepoint <- max(exp_timepoints)
-
-    # Transform the spline terms into effect curve estimates (+ covariance matrix)
-    B <- as.matrix(splines::ns(
-      x = c(1:S),
-      knots = knots_exp[2:3],
-      intercept = TRUE,
-      Boundary.knots = knots_exp[c(1,n_df_exp)]
-    ))
-    
-    class(B) <- "matrix"
-
-    coeffs_trans <- as.numeric(B %*% coeffs_spl)
-    cov_mtx <- B %*% cov_mtx_spl %*% t(B)
-
-    if(estimand_type == "TATE") {
-      # Estimate the TATE
-      num_estimand_timepoints <- estimand_time[2] - estimand_time[1] + 1
-      M <- matrix(c(rep(0, estimand_time[1] - 1),
-                    rep(1 / num_estimand_timepoints, num_estimand_timepoints),
-                    rep(0, max_exp_timepoint - estimand_time[2])
-                    ),
-                  nrow = 1)
-      tate_est <- (M %*% coeffs_trans)[1]
-      tate_se <- (sqrt(M %*% cov_mtx %*% t(M)))[1,1]
-      tate_ci <- tate_est + c(-1.96,1.96) * tate_se
-
-      results <- list(
-        model = model_ncs_mixed,
-        model_type = "ncs_mixed",
-        estimand_type = "TATE",
-        te_est = tate_est,
-        te_se = tate_se,
-        te_ci = tate_ci,
-        converged = performance::check_convergence(model_ncs_mixed)[1],
-        messages = model_ncs_mixed@optinfo$conv$lme4$messages
-      )
-    } else if(estimand_type == "PTE") {
-
-      # Estimate the PTE
-      pte_est <- as.numeric(coeffs_trans[estimand_time])
-      pte_se <- sqrt(cov_mtx[estimand_time, estimand_time])
-      pte_ci <- pte_est + c(-1.96,1.96) * pte_se
-
-      results <- list(
-        model = model_ncs_mixed,
-        model_type = "ncs_mixed",
-        estimand_type = "PTE",
-        te_est = pte_est,
-        te_se = pte_se,
-        te_ci = pte_ci,
-        converged = performance::check_convergence(model_ncs_mixed)[1],
-        messages = model_ncs_mixed@optinfo$conv$lme4$messages
-      )
-    }
-
-
-
-    # # Estimate the effect curve
-    # curve_ncs <- c(0, coeffs_trans)
-
-  } else if(method == "GEE" & estimand_type %in% c("TATE", "PTE") & exp_time == "IT") {
-
-
-    ##############################################.
-    ##### Immediate Treatment (IT) GEE model #####
-    ##############################################.
-
-
-    # Fit GEE model
-    formula <- paste0(f_out, f_cal, "treatment")
-    model_it_GEE <- geepack::geeglm(
-      stats::as.formula(formula),
-      data = dat,
-      family = family,
-      id = cluster_id,
-      corstr = corstr
-    )
-    summary_it <- summary(model_it_GEE)
-
-    # Extract an estimate and confidence interval for the estimated treatment
-    #     effect; recall that the TATE estimator for any interval and the PTE
-    #     estimators are all equivalent when using the immediate treatment model
-    te_est <- summary_it$coefficients["treatment",1]
-    te_se <- summary_it$coefficients["treatment",2]
-    te_ci <- te_est + c(-1.96,1.96) * te_se
-
-    results <- list(
-      model = model_it_GEE,
-      model_type = "it_GEE",
-      estimand_type = "TATE (IT)",
-      te_est = te_est,
-      te_se = te_se,
-      te_ci = te_ci
-    )
-  } else if(method == "GEE" & exp_time == "ETI") {
-
-
-    ###################################################.
-    ##### Exposure Time Indicator (ETI) GEE model #####
-    ###################################################.
-
-    # Fit GEE model
-    formula <- paste0(f_out, f_cal, "factor(exposure_time)")
-    model_eti_GEE <- geepack::geeglm(
-      stats::as.formula(formula),
-      data = dat,
-      family = family,
-      id = cluster_id,
-      corstr = corstr
-    )
-    summary_eti <- summary(model_eti_GEE)
-
-
-    # Specify the indices of summary_eti corresponding to the exposure time variables
-    indices <- grep("exposure_time", rownames(summary_eti$coefficients))
-    index_max <- length(indices)
-
-    # Extract coefficient estimates and covariance matrix corresponding to exposure
-    #     time variables
-    coeffs <- summary_eti$coefficients[,1][indices] # column 1 contains the estimates
-    cov_mtx <- stats::vcov(model_eti_GEE)[indices,indices]
 
     if(estimand_type == "TATE") {
 
@@ -503,13 +404,29 @@ analyze <- function(dat, method="mixed", estimand_type="TATE",
       tate_se <- (sqrt(M %*% cov_mtx %*% t(M)))[1,1]
       tate_ci <- tate_est + c(-1.96,1.96) * tate_se
 
+      # Calculate P-value (Wald test) before exponentiation
+      tate_p <- 2 * (1 - stats::pnorm(abs(tate_est / tate_se)))
+
+      if(exponentiate) {
+        tate_est_return <- exp(tate_est)
+        tate_ci_return <- exp(tate_ci)
+      } else {
+        tate_est_return <- tate_est
+        tate_ci_return <- tate_ci
+      }
+
       results <- list(
-        model = model_eti_GEE,
-        model_type = "eti_GEE",
+        model = model_eti_mixed,
+        model_type = "eti_mixed",
         estimand_type = "TATE",
-        te_est = tate_est,
+        te_est = tate_est_return,
         te_se = tate_se,
-        te_ci = tate_ci
+        te_ci = tate_ci_return,
+        te_p = tate_p,
+        converged = is_converged,
+        messages = model_eti_mixed@optinfo$conv$lme4$messages,
+        effect_curve = effect_curve,
+        dat = dat_orig
       )
 
     } else if(estimand_type == "PTE") {
@@ -519,21 +436,712 @@ analyze <- function(dat, method="mixed", estimand_type="TATE",
       pte_se <- sqrt(cov_mtx[estimand_time,estimand_time])
       pte_ci <- pte_est + c(-1.96,1.96) * pte_se
 
+      # Calculate P-value (Wald test) before exponentiation
+      pte_p <- 2 * (1 - stats::pnorm(abs(pte_est / pte_se)))
+
+      if(exponentiate) {
+        pte_est_return <- exp(pte_est)
+        pte_ci_return <- exp(pte_ci)
+      } else {
+        pte_est_return <- pte_est
+        pte_ci_return <- pte_ci
+      }
+
       results <- list(
-        model = model_eti_GEE,
-        model_type = "eti_GEE",
+        model = model_eti_mixed,
+        model_type = "eti_mixed",
         estimand_type = "PTE",
-        te_est = pte_est,
+        te_est = pte_est_return,
         te_se = pte_se,
-        te_ci = pte_ci
+        te_ci = pte_ci_return,
+        te_p = pte_p,
+        converged = is_converged,
+        messages = model_eti_mixed@optinfo$conv$lme4$messages,
+        effect_curve = effect_curve,
+        dat = dat_orig
       )
-      #
-      # # Estimate the effect curve
-      # curve_eti <- as.numeric(c(0, coeffs))
 
     }
 
+  } else if(method == "mixed" & exp_time == "DCT") {
+
+    ########################################################.
+    ##### Delayed Constant Treatment (DCT) mixed model #####
+    ########################################################.
+
+    # Ensure w is provided via the advanced params list
+    w <- advanced$w
+    if(is.null(w) || w < 1 || w >= max(dat$exposure_time)) {
+      stop("For exp_time='DCT', you must specify a valid washout period 'w' (1 <= w < max exposure time).")
+    }
+
+    # Create washout indicators for s = 1 to w
+    for (s in 1:w) {
+      dat[[paste0("washout_", s)]] <- as.integer(dat$exposure_time == s)
+    }
+    f_washout <- paste0("washout_", 1:w, collapse = " + ")
+
+    # Create the delayed constant treatment indicator for s > w
+    dat$delayed_treatment <- as.integer(dat$exposure_time > w)
+
+    # Combine exposure formula terms
+    f_exp_dct <- paste0(f_washout, " + delayed_treatment")
+
+
+    # Fit mixed model
+    formula <- stats::as.formula(paste0(
+      f_out, f_cal, f_cov, f_exp_dct, f_off, f_re
+    ))
+    model_dct_mixed <- fit_mixed(formula)
+
+    summary_dct <- summary(model_dct_mixed)
+
+    # Extract estimate and CI for the delayed treatment effect
+    te_est <- summary_dct$coefficients["delayed_treatment", 1]
+
+    if(advanced$var_est == "model") {
+      te_se <- summary_dct$coefficients["delayed_treatment", 2]
+    } else if(advanced$var_est == "robust") {
+      cov_cr  <- vcovCR.glmerMod(model_dct_mixed, cluster = dat$cluster_id,
+                                 type = advanced$var_est_type)
+      te_se  <- sqrt(cov_cr["delayed_treatment", "delayed_treatment"])
+    }
+    te_ci <- te_est + c(-1.96, 1.96) * te_se
+
+    # Calculate P-value
+    te_p <- 2 * (1 - stats::pnorm(abs(te_est / te_se)))
+
+    # Extract washout coefficients and their standard errors
+    washout_names <- paste0("washout_", 1:w)
+    est_washout <- summary_dct$coefficients[washout_names, 1]
+
+    if(advanced$var_est == "model") {
+      se_washout <- summary_dct$coefficients[washout_names, 2]
+    } else if(advanced$var_est == "robust") {
+      # cov_cr should be calculated earlier if var_est == "robust"
+      se_washout <- sqrt(diag(as.matrix(cov_cr[washout_names, washout_names, drop = FALSE])))
+    }
+
+    # Map estimates to the full vector of non-zero exposure times
+    # Find how many timepoints get the delayed constant effect
+    num_delayed <- sum(exp_times > w)
+
+    # Concatenate the washout effects and the repeated delayed effect
+    est_curve <- c(est_washout, rep(te_est, num_delayed))
+    se_curve  <- c(se_washout, rep(te_se, num_delayed))
+
+    # Calculate pointwise confidence intervals for the curve
+    ci_lower_curve <- est_curve - 1.96 * se_curve
+    ci_upper_curve <- est_curve + 1.96 * se_curve
+
+    # Handle exponentiation based on user arguments
+    if(exponentiate) {
+      est_curve_return <- exp(est_curve)
+      ci_lower_return  <- exp(ci_lower_curve)
+      ci_upper_return  <- exp(ci_upper_curve)
+      zero_value <- 1
+    } else {
+      est_curve_return <- est_curve
+      ci_lower_return  <- ci_lower_curve
+      ci_upper_return  <- ci_upper_curve
+      zero_value <- 0
+    }
+
+    # Estimate the effect curve
+    effect_curve <- list(
+      exp_time = c(0, exp_times),
+      est      = c(zero_value, as.numeric(est_curve_return)),
+      se       = c(0, as.numeric(se_curve)),
+      vcov     = NA, # Can be set to NA, or you can subset the vcov matrix if downstream functions strictly require it
+      ci_lower = c(zero_value, as.numeric(ci_lower_return)),
+      ci_upper = c(zero_value, as.numeric(ci_upper_return))
+    )
+
+    if(lme4::isSingular(model_dct_mixed)) {
+      is_converged <- FALSE
+    } else {
+      is_converged <- performance::check_convergence(model_dct_mixed)[1]
+    }
+
+    if(exponentiate) {
+      te_est <- exp(te_est)
+      te_ci <- exp(te_ci)
+      zero_value <- 1
+    } else {
+      zero_value <- 0
+    }
+
+    results <- list(
+      model = model_dct_mixed,
+      model_type = "dct_mixed",
+      estimand_type = "TATE (DCT)",
+      te_est = te_est,
+      te_se = te_se,
+      te_ci = te_ci,
+      te_p = te_p,
+      converged = is_converged,
+      messages = model_dct_mixed@optinfo$conv$lme4$messages,
+      effect_curve = effect_curve,
+      dat = dat_orig
+    )
+
+
+  } else if(method == "mixed" & exp_time == "TEH") {
+
+
+    #####################################################.
+    ##### Treatment Effect Heterogeneity (TEH) mixed model #####
+    #####################################################.
+
+
+    # Fit mixed model
+    formula <- stats::as.formula(paste0(
+      f_out, f_cal, f_cov, "treatment + (0 + treatment|exposure_time)", f_off,
+      f_re
+    ))
+    model_teh_mixed <- fit_mixed(formula)
+
+
+    summary_teh <- summary(model_teh_mixed)
+
+    # Extract random slopes for treatment and their variances from mixed model
+    re_model <- lme4::ranef(model_teh_mixed, condVar = TRUE)
+    re_treatment <- re_model$exposure_time
+
+    re_var <- attr(re_treatment, "postVar")[1,1,]
+    re_se <- sqrt(re_var)
+
+    # Extract fixed treatment effect from mixed model
+    fe_treatment <- summary_teh$coefficients["treatment",1]
+
+    # Calculate the CI for treatment effect at each exposure time
+    est_teh <- rep(fe_treatment, length(exp_times)) + re_treatment[rownames(re_treatment) != "0", "treatment"]
+    se_teh <- sqrt(summary_teh$coefficients["treatment",2]^2 + re_se[-1]^2)
+    ci_lower_teh <- est_teh - 1.96 * se_teh
+    ci_upper_teh <- est_teh + 1.96 * se_teh
+
+    if(exponentiate) {
+      est_teh_return <- exp(est_teh)
+      ci_lower_teh_return <- exp(ci_lower_teh)
+      ci_upper_teh_return <- exp(ci_upper_teh)
+      zero_value <- 1
+    } else {
+      est_teh_return <- est_teh
+      ci_lower_teh_return <- ci_lower_teh
+      ci_upper_teh_return <- ci_upper_teh
+      zero_value <- 0
+    }
+
+    # Estimate the effect curve
+    effect_curve <- list(
+      exp_time = c(0, exp_times),
+      est = c(zero_value, est_teh_return),
+      se = c(0, se_teh),
+      vcov = NA,
+      ci_upper = c(zero_value, ci_upper_teh_return),
+      ci_lower = c(zero_value, ci_lower_teh_return)
+    )
+
+    if(lme4::isSingular(model_teh_mixed)) {
+      is_converged <- FALSE
+    } else {
+      is_converged <- performance::check_convergence(model_teh_mixed)[1]
+    }
+
+    if(estimand_type == "TATE") {
+
+      # Average the per-exposure-time BLUP estimates over the estimand_time window.
+      # se_teh[s]^2 = fe_var + re_var[s], so re_var[s] = se_teh[s]^2 - fe_var.
+      # Var(TATE) = fe_var + (1/n^2) * sum(re_var[s] for s in window),
+      #   assuming independence of random slopes across exposure times.
+      window_mask <- exp_times >= estimand_time[1] & exp_times <= estimand_time[2]
+      n_window <- sum(window_mask)
+      fe_var <- summary_teh$coefficients["treatment", 2]^2
+      re_var_window <- pmax(se_teh[window_mask]^2 - fe_var, 0)
+
+      tate_est <- mean(est_teh[window_mask])
+      tate_se <- sqrt(fe_var + sum(re_var_window) / n_window^2)
+      tate_ci <- tate_est + c(-1.96, 1.96) * tate_se
+
+      # Calculate P-value (Wald test) before exponentiation
+      tate_p <- 2 * (1 - stats::pnorm(abs(tate_est / tate_se)))
+
+      if(exponentiate) {
+        tate_est_return <- exp(tate_est)
+        tate_ci_return <- exp(tate_ci)
+      } else {
+        tate_est_return <- tate_est
+        tate_ci_return <- tate_ci
+      }
+
+      results <- list(
+        model = model_teh_mixed,
+        model_type = "teh_mixed",
+        estimand_type = "TATE",
+        te_est = tate_est_return,
+        te_se = tate_se,
+        te_ci = tate_ci_return,
+        te_p = tate_p,
+        converged = is_converged,
+        messages = model_teh_mixed@optinfo$conv$lme4$messages,
+        effect_curve = effect_curve,
+        dat = dat_orig
+      )
+
+    } else if(estimand_type == "PTE") {
+
+      # Estimate the PTE by combining the estimates from the fixed effect component and the random effect for the requested timepoint
+      re_treatment_pte <- re_treatment[rownames(re_treatment) == as.character(estimand_time), "treatment"]
+      pte_est <- lme4::fixef(model_teh_mixed)["treatment"] + re_treatment_pte
+
+      # Safely find the exact position index for the standard error by matching the rownames
+      time_index <- match(as.character(estimand_time), rownames(re_treatment))
+      re_se_pte <- re_se[time_index]
+
+      pte_se <- sqrt(summary_teh$coefficients["treatment",2]^2 + re_se_pte^2)
+      pte_ci <- pte_est + c(-1.96,1.96) * pte_se
+
+      # Calculate P-value (Wald test) before exponentiation
+      pte_p <- 2 * (1 - stats::pnorm(abs(pte_est / pte_se)))
+
+      if(exponentiate) {
+        pte_est_return <- exp(pte_est)
+        pte_ci_return <- exp(pte_ci)
+      } else {
+        pte_est_return <- pte_est
+        pte_ci_return <- pte_ci
+      }
+
+      results <- list(
+        model = model_teh_mixed,
+        model_type = "teh_mixed",
+        estimand_type = "PTE",
+        te_est = pte_est_return,
+        te_se = pte_se,
+        te_ci = pte_ci_return,
+        te_p = pte_p,
+        converged = is_converged,
+        messages = model_teh_mixed@optinfo$conv$lme4$messages,
+        effect_curve = effect_curve,
+        dat = dat_orig
+      )
+
+    }
+
+  } else if(method == "mixed" & exp_time == "NCS") {
+
+
+    ############################################.
+    ##### Natural Cubic Spline (NCS) mixed model #####
+    ############################################.
+
+    # Create the spline basis
+    S <- max(dat$exposure_time)
+    knots_exp <- seq(0, S, length.out=advanced$n_knots_exp)
+    ns_basis <- splines::ns(
+      x = dat$exposure_time,
+      knots = knots_exp[2:(advanced$n_knots_exp-1)],
+      intercept = TRUE,
+      Boundary.knots = knots_exp[c(1,advanced$n_knots_exp)]
+    )
+
+    dat$b <- rep(NA, nrow(dat))
+    for (i in 1:advanced$n_knots_exp) {
+      dat[[paste0("b", i)]] <- ns_basis[,i] * dat$treatment
+    }
+
+    # Fit mixed model
+    formula <- stats::as.formula(paste0(
+      f_out, f_cal, f_cov, paste0("b", 1:advanced$n_knots_exp, collapse = " + "),
+      f_off, f_re
+    ))
+    model_ncs_mixed <- fit_mixed(formula)
+
+    summary_ncs <- summary(model_ncs_mixed)
+
+    # Specify the indices corresponding to the spline terms
+    indices <- grep("^b[0-9]+$", rownames(summary_ncs$coefficients))
+    index_max <- length(indices)
+
+    # Extract coefficient estimates and covariance matrix corresponding to spline
+    # terms
+    coeffs_orig <- summary_ncs$coefficients[,1]
+    coeffs_spl <- coeffs_orig[indices]
+    if(advanced$var_est == "model") {
+      cov_orig_full <- stats::vcov(model_ncs_mixed)
+      cov_mtx_spl <- cov_orig_full[indices,indices]
+      # te_se <- summary_it$coefficients["treatment",2]
+    } else if(advanced$var_est == "robust") {
+      cov_orig_full <- vcovCR.glmerMod(model_ncs_mixed, cluster = dat$cluster_id,
+                                       type = advanced$var_est_type)
+      indices <- grep("^b[0-9]+$", rownames(cov_orig_full))
+      cov_mtx_spl <- cov_orig_full[indices,indices]
+    }
+
+    # Transform the spline terms into effect curve estimates (+ covariance matrix)
+    B <- as.matrix(splines::ns(
+      x = c(1:S),
+      knots = knots_exp[2:(advanced$n_knots_exp-1)],
+      intercept = TRUE,
+      Boundary.knots = knots_exp[c(1,advanced$n_knots_exp)]
+    ))
+
+    class(B) <- "matrix"
+
+    coeffs_trans <- as.numeric(B %*% coeffs_spl)
+    cov_mtx <- B %*% cov_mtx_spl %*% t(B)
+    se_ncs <- sqrt(diag(matrix(cov_mtx, nrow = nrow(cov_mtx))))
+
+
+    # Calculate the CI for treatment effect at each exposure time
+    ci_lower_ncs <- coeffs_trans - 1.96 * se_ncs
+    ci_upper_ncs <- coeffs_trans + 1.96 * se_ncs
+
+    if(exponentiate) {
+      coeffs_trans_return <- exp(coeffs_trans)
+      ci_lower_ncs_return <- exp(ci_lower_ncs)
+      ci_upper_ncs_return <- exp(ci_upper_ncs)
+      zero_value <- 1
+    } else {
+      coeffs_trans_return <- coeffs_trans
+      ci_lower_ncs_return <- ci_lower_ncs
+      ci_upper_ncs_return <- ci_upper_ncs
+      zero_value <- 0
+    }
+
+    # Estimate the effect curve
+    effect_curve <- list(
+      exp_time = c(0, 1:S),
+      est = c(zero_value, coeffs_trans_return),
+      se = c(0, se_ncs),
+      vcov = cov_mtx,
+      ci_lower = c(zero_value, ci_lower_ncs_return),
+      ci_upper = c(zero_value, ci_upper_ncs_return)
+    )
+
+    # Create A* block diagonal transformation matrix to return
+
+    if(advanced$return_ncs == TRUE) {
+      # Build T_mat by column index rather than block position, so it remains
+      #     correct regardless of where the spline terms sit among the fixed
+      #     effects. Rows: non-spline params (identity), then exposure times (B).
+      total_fixed_params <- length(coeffs_orig)
+      other_indices <- setdiff(seq_len(total_fixed_params), indices)
+      n_other_params <- length(other_indices)
+
+      T_mat <- matrix(0, nrow = n_other_params + nrow(B),
+                      ncol = total_fixed_params)
+      T_mat[cbind(seq_len(n_other_params), other_indices)] <- 1
+      T_mat[n_other_params + seq_len(nrow(B)), indices] <- B
+
+      rownames(T_mat) <- c(rownames(summary_ncs$coefficients)[-indices],
+                           paste0("ExpTime_", 1:nrow(B)))
+      colnames(T_mat) <- names(coeffs_orig)
+
+      coeffs_trans_full <- as.numeric(T_mat %*% coeffs_orig)
+      cov_trans_full <- T_mat %*% cov_orig_full %*% t(T_mat)
+
+      name_prefix <- rownames(summary_ncs$coefficients)[-indices]
+      name_suffix <- paste0("ExpTime_", 1:nrow(B))
+      new_names <- c(name_prefix, name_suffix)
+
+      names(coeffs_trans_full) <- new_names
+      rownames(cov_trans_full) <- new_names
+      colnames(cov_trans_full) <- new_names
+    }
+
+    if(lme4::isSingular(model_ncs_mixed)) {
+      is_converged <- FALSE
+    } else {
+      is_converged <- performance::check_convergence(model_ncs_mixed)[1]
+    }
+
+    if(estimand_type == "TATE") {
+      # Estimate the TATE
+      num_estimand_timepoints <- estimand_time[2] - estimand_time[1] + 1
+      M <- matrix(c(rep(0, estimand_time[1] - 1),
+                    rep(1 / num_estimand_timepoints, num_estimand_timepoints),
+                    rep(0, max_exp_time - estimand_time[2])),
+                  nrow = 1)
+      tate_est <- (M %*% coeffs_trans)[1]
+      tate_se <- (sqrt(M %*% cov_mtx %*% t(M)))[1,1]
+      tate_ci <- tate_est + c(-1.96,1.96) * tate_se
+
+      # Calculate P-value (Wald test) before exponentiation
+      tate_p <- 2 * (1 - stats::pnorm(abs(tate_est / tate_se)))
+
+      if(exponentiate) {
+        tate_est_return <- exp(tate_est)
+        tate_ci_return <- exp(tate_ci)
+      } else {
+        tate_est_return <- tate_est
+        tate_ci_return <- tate_ci
+      }
+
+      results <- list(
+        model = model_ncs_mixed,
+        model_type = "ncs_mixed",
+        estimand_type = "TATE",
+        te_est = tate_est_return,
+        te_se = tate_se,
+        te_ci = tate_ci_return,
+        te_p = tate_p,
+        converged = is_converged,
+        messages = model_ncs_mixed@optinfo$conv$lme4$messages,
+        effect_curve = effect_curve,
+        dat = dat_orig
+      )
+    } else if(estimand_type == "PTE") {
+
+      # Estimate the PTE
+      pte_est <- as.numeric(coeffs_trans[estimand_time])
+      pte_se <- sqrt(cov_mtx[estimand_time, estimand_time])
+      pte_ci <- pte_est + c(-1.96,1.96) * pte_se
+
+      # Calculate P-value (Wald test) before exponentiation
+      pte_p <- 2 * (1 - stats::pnorm(abs(pte_est / pte_se)))
+
+      if(exponentiate) {
+        pte_est_return <- exp(pte_est)
+        pte_ci_return <- exp(pte_ci)
+      } else {
+        pte_est_return <- pte_est
+        pte_ci_return <- pte_ci
+      }
+
+      results <- list(
+        model = model_ncs_mixed,
+        model_type = "ncs_mixed",
+        estimand_type = "PTE",
+        te_est = pte_est_return,
+        te_se = pte_se,
+        te_ci = pte_ci_return,
+        te_p = pte_p,
+        converged = is_converged,
+        messages = model_ncs_mixed@optinfo$conv$lme4$messages,
+        effect_curve = effect_curve,
+        dat = dat_orig
+      )
+    }
+
+    # Always store V_orig and knots_exp for continuous plotting
+    results$V_orig    <- cov_orig_full
+    results$knots_exp <- knots_exp
+    if(advanced$return_ncs == TRUE) {
+      results$T_mat    <- T_mat
+      results$beta_new <- coeffs_trans_full
+      results$V_new    <- cov_trans_full
+    }
+
+  } else if(method == "GEE" & estimand_type %in% c("TATE", "PTE") & exp_time == "IT") {
+
+    ##############################################.
+    ##### Immediate Treatment (IT) GEE model #####
+    ##############################################.
+
+    # Fit GEE model
+    formula <- paste0(f_out, f_cal, f_cov, "treatment", f_off)
+
+    model_it_GEE <- geepack::geeglm(
+      stats::as.formula(formula),
+      data = dat,
+      family = family,
+      id = cluster_id,
+      corstr = corstr
+    )
+
+    summary_it <- summary(model_it_GEE)
+
+    # Extract an estimate and confidence interval for the estimated treatment
+    #     effect; recall that the TATE estimator for any interval and the PTE
+    #     estimators are all equivalent when using the immediate treatment model
+    te_est <- summary_it$coefficients["treatment",1]
+    te_se <- summary_it$coefficients["treatment",2]
+    te_ci <- te_est + c(-1.96,1.96) * te_se
+
+    # Calculate P-value (Wald test) before exponentiation
+    te_p <- 2 * (1 - stats::pnorm(abs(te_est / te_se)))
+
+    if(exponentiate) {
+      te_est <- exp(te_est)
+      te_ci  <- exp(te_ci)
+      zero_value <- 1
+    } else {
+      zero_value <- 0
+    }
+
+    # Estimate the effect curve
+    effect_curve <- list(
+      exp_time = c(0, exp_times),
+      est      = c(zero_value, rep(te_est, length(exp_times))),
+      se       = c(0, rep(te_se, length(exp_times))),
+      vcov     = NA,
+      ci_lower = c(zero_value, rep(te_ci[1], length(exp_times))),
+      ci_upper = c(zero_value, rep(te_ci[2], length(exp_times)))
+    )
+
+    # geepack stores an error code; 0 indicates successful convergence.
+    is_converged <- model_it_GEE$geese$error == 0
+    conv_messages <- if(is_converged) NULL else "geeglm failed to converge or reached max iterations."
+
+    results <- list(
+      model        = model_it_GEE,
+      model_type   = "it_GEE",
+      estimand_type = "TATE (IT)",
+      te_est       = te_est,
+      te_se        = te_se,
+      te_ci        = te_ci,
+      te_p         = te_p,
+      converged    = is_converged,
+      messages     = conv_messages,
+      effect_curve = effect_curve,
+      dat          = dat_orig
+    )
+
+  } else if(method == "GEE" & exp_time == "ETI") {
+
+    ###################################################.
+    ##### Exposure Time Indicator (ETI) GEE model #####
+    ###################################################.
+
+    for (i in c(1:length(exp_times))) {
+      dat[[paste0("exp_",exp_times[i])]] <- as.integer(dat$exposure_time==exp_times[i])
+    }
+
+    f_exp <- paste0("exp_", exp_times, collapse = " + ")
+
+    # Fit GEE model
+    formula <- paste0(f_out, f_cal, f_cov, f_exp, f_off)
+
+    model_eti_GEE <- geepack::geeglm(
+      stats::as.formula(formula),
+      data = dat,
+      family = family,
+      id = cluster_id,
+      corstr = corstr
+    )
+
+    summary_eti <- summary(model_eti_GEE)
+
+    # Specify the indices of summary_eti corresponding to the exposure time variables
+    indices <- grep("^exp_[0-9]+$", rownames(summary_eti$coefficients))
+    index_max <- length(indices)
+
+    # Extract coefficient estimates and covariance matrix corresponding to exposure time variables
+    coeffs <- summary_eti$coefficients[,1][indices] # column 1 contains the estimates
+    cov_mtx <- stats::vcov(model_eti_GEE)[indices,indices]
+    se_eti  <- sqrt(diag(as.matrix(cov_mtx)))
+
+    # Calculate the CI for treatment effect at each exposure time
+    ci_lower_eti <- coeffs - 1.96 * se_eti
+    ci_upper_eti <- coeffs + 1.96 * se_eti
+
+    if(exponentiate) {
+      coeffs_return       <- exp(coeffs)
+      ci_lower_eti_return <- exp(ci_lower_eti)
+      ci_upper_eti_return <- exp(ci_upper_eti)
+      zero_value <- 1
+    } else {
+      coeffs_return       <- coeffs
+      ci_lower_eti_return <- ci_lower_eti
+      ci_upper_eti_return <- ci_upper_eti
+      zero_value <- 0
+    }
+
+    # Estimate the effect curve
+    effect_curve <- list(
+      exp_time = c(0, exp_times),
+      est      = c(zero_value, as.numeric(coeffs_return)),
+      se       = c(0, se_eti),
+      vcov     = cov_mtx,
+      ci_lower = c(zero_value, as.numeric(ci_lower_eti_return)),
+      ci_upper = c(zero_value, as.numeric(ci_upper_eti_return))
+    )
+
+    is_converged <- model_eti_GEE$geese$error == 0
+    conv_messages <- if(is_converged) NULL else "geeglm failed to converge or reached max iterations."
+
+    if(estimand_type == "TATE") {
+
+      # Estimate the TATE
+      num_estimand_timepoints <- estimand_time[2] - estimand_time[1] + 1
+      M <- matrix(c(rep(0, estimand_time[1] - 1),
+                    rep(1 / num_estimand_timepoints, num_estimand_timepoints),
+                    rep(0, index_max - estimand_time[2])
+      ),
+      nrow = 1)
+      tate_est <- (M %*% coeffs)[1]
+      tate_se <- (sqrt(M %*% cov_mtx %*% t(M)))[1,1]
+      tate_ci <- tate_est + c(-1.96,1.96) * tate_se
+
+      # Calculate P-value (Wald test) before exponentiation
+      tate_p <- 2 * (1 - stats::pnorm(abs(tate_est / tate_se)))
+
+      if(exponentiate) {
+        tate_est_return <- exp(tate_est)
+        tate_ci_return  <- exp(tate_ci)
+      } else {
+        tate_est_return <- tate_est
+        tate_ci_return  <- tate_ci
+      }
+
+      results <- list(
+        model         = model_eti_GEE,
+        model_type    = "eti_GEE",
+        estimand_type = "TATE",
+        te_est        = tate_est_return,
+        te_se         = tate_se,
+        te_ci         = tate_ci_return,
+        te_p          = tate_p,
+        converged     = is_converged,
+        messages      = conv_messages,
+        effect_curve  = effect_curve,
+        dat           = dat_orig
+      )
+
+    } else if(estimand_type == "PTE") {
+
+      # Estimate the PTE
+      pte_est <- as.numeric(coeffs[estimand_time])
+      pte_se <- sqrt(cov_mtx[estimand_time,estimand_time])
+      pte_ci <- pte_est + c(-1.96,1.96) * pte_se
+
+      # Calculate P-value (Wald test) before exponentiation
+      pte_p <- 2 * (1 - stats::pnorm(abs(pte_est / pte_se)))
+
+      if(exponentiate) {
+        pte_est_return <- exp(pte_est)
+        pte_ci_return  <- exp(pte_ci)
+      } else {
+        pte_est_return <- pte_est
+        pte_ci_return  <- pte_ci
+      }
+
+      results <- list(
+        model         = model_eti_GEE,
+        model_type    = "eti_GEE",
+        estimand_type = "PTE",
+        te_est        = pte_est_return,
+        te_se         = pte_se,
+        te_ci         = pte_ci_return,
+        te_p          = pte_p,
+        converged     = is_converged,
+        messages      = conv_messages,
+        effect_curve  = effect_curve,
+        dat           = dat_orig
+      )
+
+    }
   }
+
+  # Append configuration metadata to the results object for print function
+  results$method <- method
+  results$exp_time <- exp_time
+  results$cal_time <- cal_time
+  results$re <- re
+  results$corstr <- corstr
+  results$covariates <- covariates
+  results$exponentiated <- exponentiate
 
   class(results) <- c("list", "sw_analysis")
 

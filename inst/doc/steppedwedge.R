@@ -99,16 +99,27 @@ print(analysis_4)
 analysis_5 <- analyze(
   dat = dat,
   method = "mixed",
-  estimand_type = "TATE", 
-  exp_time = "TEH",
-  family = binomial
+  estimand_type = "TATE",
+  exp_time = "DCT",
+  family = binomial,
+  advanced = params(w = 2)
 )
 
 print(analysis_5)
 
 ## -----------------------------------------------------------------------------
+
+dat_cont <- load_data(
+  time = "period",
+  cluster_id = "cluster",
+  individual_id = NULL,
+  treatment = "trt",
+  outcome = "outcome_cont",
+  data = sw_data_example
+)
+
 analysis_6 <- analyze(
-  dat = dat,
+  dat = dat_cont,
   method = "mixed",
   estimand_type = "TATE", 
   exp_time = "NCS",
@@ -116,4 +127,63 @@ analysis_6 <- analyze(
 )
 
 print(analysis_6)
+
+## -----------------------------------------------------------------------------
+
+dat_binom <- load_data(
+  time ="period",
+  cluster_id = "cluster",
+  individual_id = NULL,
+  treatment = "trt",
+  outcome = c("numerator", "denominator"),
+  data = sw_data_example_binom
+)
+
+
+## -----------------------------------------------------------------------------
+
+analysis_binom <- analyze(
+  dat = dat_binom,
+  method = "mixed",
+  family = binomial,
+  estimand_type = "TATE", 
+  exp_time = "ETI")
+
+print(analysis_binom)
+
+
+## -----------------------------------------------------------------------------
+
+IT_model <- analyze(
+  dat = dat_cont, method = "mixed", estimand_type = "TATE",
+  estimand_time = c(1, 4), exp_time = "IT"
+)
+ETI_model <- analyze(
+  dat = dat_cont, method = "mixed", estimand_type = "TATE", 
+  estimand_time = c(1, 4), exp_time = "ETI"
+)
+NCS_4_model <- analyze(
+  dat = dat_cont, method = "mixed", estimand_type = "TATE",
+  estimand_time = c(1, 4), exp_time = "NCS", 
+  advanced = params(n_knots_exp = 4)
+)
+DCT_model <- analyze(
+  dat = dat_cont, method = "mixed", estimand_type = "TATE",
+  estimand_time = c(1, 4), exp_time = "DCT",
+  advanced = params(w = 2)
+)
+
+plot_effect_curves(IT_model, ETI_model, NCS_4_model, DCT_model, facet_nrow = 2)
+
+
+
+## ----fig.height = 8-----------------------------------------------------------
+
+plot_clusters(analysis_6, ncol = 3)
+
+
+## ----fig.height = 8-----------------------------------------------------------
+
+plot_clusters(analysis_4, ncol = 3)
+
 

@@ -8,13 +8,14 @@ analyze(
   dat,
   method = "mixed",
   estimand_type = "TATE",
-  estimand_time = c(1, attr(dat, "n_seq")),
+  estimand_time = c(1, max(dat$exposure_time)),
   exp_time = "IT",
   cal_time = "categorical",
   family = stats::gaussian,
+  exponentiate = FALSE,
   re = c("clust", "time"),
   corstr = "exchangeable",
-  offset = NULL
+  advanced = params()
 )
 }
 \arguments{
@@ -34,13 +35,16 @@ average over. When estimand_type="PTE", `estimand_time` must be a numeric
 vector of length 1, representing the time period of interest. See
 examples.}
 
-\item{exp_time}{One of c("IT", "ETI", "NCS", "TEH"); model for exposure time.
+\item{exp_time}{One of c("IT", "ETI", "DCT", "NCS", "TEH"); model for exposure time.
 "IT" encodes an immediate treatment model with a single treatment effect
 parameter. "ETI" is an exposure time indicator model, including one
 indicator variable for each exposure time point. "NCS" uses a natural
 cubic spline model for the exposure time trend. "TEH" includes a random
 slope term in the model, allowing the treatment effect to vary by
-timepoint.}
+timepoint. "DCT" encodes a delayed constant treatment model, which
+estimates individual effects for a specified number of washout periods
+(set via the `w` parameter in `advanced`) followed by a single constant
+treatment effect.}
 
 \item{cal_time}{One of c("categorical", "NCS", "linear", "none"); model for
 calendar time. "categorical" uses indicator variables for discrete time
@@ -51,25 +55,53 @@ trend.}
 
 \item{family}{A family object; see documentation for `glm`.}
 
+\item{exponentiate}{Logical; if TRUE, return exponentiated treatment effect
+estimates and confidence intervals (including in the `effect_curve`
+object). Defaults to FALSE.}
+
 \item{re}{A character vector of random effects to include; only relevant if
 method="mixed" is used. Possible random effects include "clust" (random
-intercept for cluster), "time" (random intercept for cluster-time
-interaction), "ind" (random intercept for individuals; appropriate when a
-cohort design is used), "tx" (random treatment effect)}
+intercept for cluster), "time" (random intercept for each cluster-period,
+i.e. each combination of cluster and calendar time; calendar time is the
+`time` variable passed to `load_data()`, not exposure time), "ind"
+(random intercept for individuals; appropriate when a cohort design is
+used), and "tx" (a cluster-level random slope on treatment; see
+Details).}
 
 \item{corstr}{One of c("independence", "exchangeable", "ar1"); only relevant
 if method="GEE" is used. Defines the GEE working correlation structure;
 see the documentation for `geepack::geeglm`.}
 
-\item{offset}{A linear predictor offset term; see docs for `lme4::lmer`.}
+\item{advanced}{A list of options returned by \code{\link{params}}.}
 }
 \value{
 A list with the model object, model type as a string, estimand type
-as a string, numeric treatment effect estimate, numeric treatment effect standard error, and
-treatment effect 95% confidence interval as a numeric vector of length 2
+as a string, numeric treatment effect estimate, numeric treatment effect standard error,
+treatment effect 95% confidence interval as a numeric vector of length 2,
+p-value corresponding to the null hypothesis that the main treatment effect
+estimand equals zero, a list with treatment effect estimates (and standard errors
+and 95% confidence intervals) at each exposure timepoint, the original dataframe
+passed to `analyze()`, and an indicator whether the effect estimates and CI
+are exponentiated.
 }
 \description{
 Analyze a stepped wedge dataset
+}
+\details{
+Covariates specified via the `covariates` argument of
+    \code{\link{load_data}} are included in the mean model as additive main
+    effects, alongside the calendar time and exposure time terms. Covariates
+    should typically be measured before randomization.
+
+    With `re = "tx"`, each cluster has a random slope on the treatment
+    indicator. This results in an additive deviation from the main treatment
+    effect coefficient. In models that allow for a time-varying treatment
+    effect (ETI, NCS, DCT, and TEH), the cluster-specific deviation results
+    in an additive scaling of the entire effect curve. Here, "additive"
+    refers to the linear predictor scale; the effects relative to the outcome
+    will be different if a nonlinear link function is used. For example, if a
+    log link function is used, the deviations will have a multiplicative
+    effect on the outcome.
 }
 \examples{
 # Load data
@@ -87,5 +119,28 @@ results_pte <- analyze(dat = test_data, method = "mixed", estimand_type = "PTE",
 estimand_time = 3, exp_time = "ETI")
 
 results_pte
+
+# Analysis example 3: TATE estimand for exposure times 1 through 4, Natural Cubic Splines model
+results_tate_ncs <- analyze(dat = test_data, method = "mixed", estimand_type = "TATE",
+estimand_time = c(1, 4), exp_time = "NCS", advanced = params(n_knots_exp = 4))
+
+results_tate_ncs
+
+# Analysis example 4: TATE estimand for exposure times 1 through 4 with binomial outcome data
+# Load data
+test_data_bin <- load_data(time ="period", cluster_id = "cluster", individual_id = NULL,
+treatment = "trt", outcome = c("numerator", "denominator"), data = sw_data_example_binom)
+
+results_pte_bin <- analyze(dat = test_data_bin, family = binomial, method = "mixed",
+estimand_type = "TATE", estimand_time = c(1, 4), exp_time = "ETI")
+
+results_pte_bin
+
+# Analysis example 5: TATE estimand using the Delayed Constant Treatment (DCT) model,
+# with a washout period of w = 2 exposure times
+results_tate_dct <- analyze(dat = test_data, method = "mixed", estimand_type = "TATE",
+estimand_time = c(1, 4), exp_time = "DCT", advanced = params(w = 2))
+
+results_tate_dct
 
 }
